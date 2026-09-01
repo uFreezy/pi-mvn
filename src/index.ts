@@ -2,11 +2,10 @@
  * pi-mvn — Maven/Java tooling for the pi coding agent.
  *
  * Four tools (build, test, run, project) that wrap Maven and hand back the ten
- * lines that matter instead of the two thousand Maven printed, plus a `/mvn`
- * slash command so a human can drive the same loop.
+ * lines that matter instead of the two thousand Maven printed, a `/mvn` command
+ * so a human can drive the same loop, and a status panel with an actions menu.
  */
 
-import { join } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
 	DEFAULT_MAX_BYTES,
@@ -16,7 +15,19 @@ import {
 	type ExtensionContext,
 	truncateTail,
 } from "@earendil-works/pi-coding-agent";
+import type { KeyId, TUI } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import {
+	type ActionSpec,
+	DEFAULT_TIMEOUT_MINUTES,
+	PRESETS,
+	filterArgs,
+	resolveModule,
+	resolveRunTarget,
+	runAction,
+	selectionArgs,
+} from "./actions.ts";
+import { openMenu } from "./menu.ts";
 import {
 	BASE_ARGS,
 	type BackgroundApp,
@@ -28,97 +39,18 @@ import {
 	tailLog,
 	writeLog,
 } from "./maven.ts";
-import { type BuildResult, formatBuildResult, formatDependencyTree, parseBuildOutput } from "./parse.ts";
-import { findJar, findMainClasses, loadProject, type MavenProject } from "./project.ts";
-
-const DEFAULT_TIMEOUT_MINUTES = 15;
+import { DEFAULT_CONFIG, panel, renderPanel, saveConfig } from "./panel.ts";
+import { findMainClasses, loadProject, type MavenProject } from "./project.ts";
+import { formatBuildResult, formatDependencyTree, parseBuildOutput } from "./parse.ts";
 
 function requireProject(ctx: { cwd: string }): MavenProject {
-	const project = loadProject(ctx.cwd);
+	const project = panel.project ?? loadProject(ctx.cwd);
 	if (!project) {
 		throw new Error(
 			`No pom.xml found in ${ctx.cwd} or any parent directory. pi-mvn needs a Maven project; use bash for non-Maven builds.`,
 		);
 	}
 	return project;
-}
-
-/** Accept either a module directory ("services/api") or an artifactId ("api"). */
-function resolveModule(project: MavenProject, module: string | undefined): string | undefined {
-	if (!module) return undefined;
-	const cleaned = module.replace(/^@/, "").replace(/\/+$/, "");
-	const byPath = project.modules.find((m) => m.path === cleaned);
-	if (byPath) return byPath.path;
-	const byName = project.modules.find((m) => m.name === cleaned);
-	if (byName) return byName.path;
-	throw new Error(
-		`Unknown module "${module}". Available: ${project.modules.map((m) => m.path || "(root)").join(", ")}`,
-	);
-}
-
-function selectionArgs(project: MavenProject, module?: string, profiles?: string[]): string[] {
-	const args: string[] = [];
-	const path = resolveModule(project, module);
-	if (path) args.push("-pl", path, "-am");
-	if (profiles?.length) args.push("-P", profiles.join(","));
-	return args;
-}
-
-interface MavenToolDetails {
-	command: string;
-	exitCode: number;
-	durationMs: number;
-	result: BuildResult;
-	logPath?: string;
-}
-
-/** Run Maven, parse it, and shape the compact text + details the tool returns. */
-async function execAndFormat(
-	project: MavenProject,
-	args: string[],
-	label: string,
-	ctx: ExtensionContext,
-	signal: AbortSignal | undefined,
-	onUpdate: ((partial: { content: { type: "text"; text: string }[]; details: unknown }) => void) | undefined,
-	timeoutMinutes = DEFAULT_TIMEOUT_MINUTES,
-) {
-	// BASE_ARGS are always present; showing them on every line is just noise.
-	const command = `${project.runnerLabel} ${args.filter((a) => !BASE_ARGS.includes(a)).join(" ")}`;
-
-	const run = await runMaven(project.runner, args, {
-		cwd: project.root,
-		signal,
-		timeoutMs: timeoutMinutes * 60_000,
-		onPhase: onUpdate
-			? (phase) => onUpdate({ content: [{ type: "text", text: `${command}\n  ${phase}` }], details: {} })
-			: undefined,
-	});
-
-	const result = parseBuildOutput(run.output);
-	const succeeded = result.ok && run.exitCode === 0;
-	const logPath = succeeded ? undefined : writeLog(run.output, label);
-
-	let text = formatBuildResult(result, {
-		command,
-		durationMs: run.durationMs,
-		exitCode: run.exitCode,
-		root: project.root,
-		logPath,
-	});
-
-	if (run.timedOut) {
-		text += `\n\nTimed out after ${timeoutMinutes} minutes and was killed. Raise timeoutMinutes, or start long-running processes with mvn_run background=true.`;
-	}
-
-	const details: MavenToolDetails = {
-		command,
-		exitCode: run.exitCode,
-		durationMs: run.durationMs,
-		result,
-		logPath,
-	};
-
-	return { content: [{ type: "text" as const, text }], details, succeeded };
 }
 
 function describeApp(app: BackgroundApp): string {
@@ -128,6 +60,93 @@ function describeApp(app: BackgroundApp): string {
 }
 
 export default function (pi: ExtensionAPI) {
+	// ------------------------------------------------------------------ panel ---
+
+	let tui: TUI | undefined;
+	let ticker: NodeJS.Timeout | undefined;
+	let tickMs = 0;
+	let frame = 0;
+
+	/** Re-tune the redraw interval: fast while building, slow while an app runs, off when idle. */
+	function retune(): void {
+		const anyApp = [...runningApps.values()].some((app) => app.child.exitCode === null);
+		const wanted = !panel.config.enabled || !panel.project ? 0 : panel.running ? 120 : anyApp ? 1000 : 0;
+		if (wanted === tickMs) return;
+		tickMs = wanted;
+		if (ticker) clearInterval(ticker);
+		ticker = undefined;
+		if (!wanted) return;
+		ticker = setInterval(() => {
+			frame++;
+			tui?.requestRender();
+		}, wanted);
+		ticker.unref?.();
+	}
+
+	function refresh(): void {
+		retune();
+		tui?.requestRender();
+	}
+
+	function mount(ctx: ExtensionContext | ExtensionCommandContext): void {
+		if (!panel.config.enabled || !panel.project) {
+			ctx.ui.setWidget("pi-mvn-panel", undefined);
+			retune();
+			return;
+		}
+		ctx.ui.setWidget(
+			"pi-mvn-panel",
+			(instance, theme) => {
+				tui = instance;
+				return {
+					// Rendered fresh every frame, so a theme switch needs no cache busting.
+					render: (width: number) => renderPanel(theme, width, frame),
+					invalidate: () => {},
+				};
+			},
+			{ placement: panel.config.placement },
+		);
+		retune();
+	}
+
+	pi.on("session_start", async (_event, ctx) => {
+		panel.project = loadProject(ctx.cwd);
+		if (ctx.hasUI) mount(ctx);
+	});
+
+	pi.on("session_shutdown", async () => {
+		if (ticker) clearInterval(ticker);
+		ticker = undefined;
+		stopAllApps();
+	});
+
+	const report = (text: string) => {
+		pi.sendMessage({ customType: "pi-mvn", content: text, display: true, details: {} }, { deliverAs: "nextTurn" });
+	};
+
+	// A malformed menuKey in the config file must not take the whole extension down.
+	try {
+		registerMenuShortcut();
+	} catch {
+		panel.config.menuKey = DEFAULT_CONFIG.menuKey;
+		registerMenuShortcut();
+	}
+
+	function registerMenuShortcut(): void {
+		pi.registerShortcut(panel.config.menuKey as KeyId, {
+			description: "Maven actions menu",
+			handler: async (ctx) => {
+				const project = panel.project ?? loadProject(ctx.cwd);
+				if (!project) {
+					ctx.ui.notify("No Maven project here.", "warning");
+					return;
+				}
+				panel.project = project;
+				await openMenu(ctx, project, { report, refresh });
+			},
+		});
+	}
+
 	// ---------------------------------------------------------------- build ---
 
 	pi.registerTool({
@@ -158,25 +177,23 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const project = requireProject(ctx);
 			const goals = params.goals?.length ? params.goals : ["compile"];
-			const args = [
-				...BASE_ARGS,
-				...goals,
-				...selectionArgs(project, params.module, params.profiles),
-				...(params.skipTests ? ["-DskipTests"] : []),
-				...(params.args ?? []),
-			];
+			const spec: ActionSpec = {
+				id: goals.join("+"),
+				label: goals.join(" "),
+				goals,
+				extra: [...(params.skipTests ? ["-DskipTests"] : []), ...(params.args ?? [])],
+				module: params.module,
+				profiles: params.profiles,
+				timeoutMinutes: params.timeoutMinutes,
+			};
 
-			const { content, details, succeeded } = await execAndFormat(
-				project,
-				args,
-				"build",
-				ctx,
+			const outcome = await runAction(project, spec, {
 				signal,
-				onUpdate,
-				params.timeoutMinutes,
-			);
-			if (!succeeded) throw new Error(content[0].text);
-			return { content, details };
+				onStateChange: refresh,
+				onProgress: onUpdate ? (text) => onUpdate({ content: [{ type: "text", text }], details: {} }) : undefined,
+			});
+			if (!outcome.ok) throw new Error(outcome.text);
+			return { content: [{ type: "text", text: outcome.text }], details: outcome.details };
 		},
 	});
 
@@ -206,42 +223,40 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const project = requireProject(ctx);
 			const scope = params.scope ?? "unit";
-			const args = [...BASE_ARGS];
+			const goals = scope === "unit" ? ["test"] : ["verify"];
+			const extra: string[] = [];
 
 			if (scope === "unit") {
-				args.push("test");
-				if (params.filter) args.push(`-Dtest=${params.filter}`);
+				if (params.filter) extra.push(...filterArgs(params.filter));
 			} else if (scope === "integration") {
-				args.push("verify");
 				// Surefire and Failsafe share -DskipTests, so there is no clean "skip
 				// only unit tests" switch. Handing Surefire a pattern that matches
 				// nothing is the standard way to run Failsafe alone.
-				args.push("-Dtest=!*");
-				if (params.filter) args.push(`-Dit.test=${params.filter}`);
+				extra.push("-Dtest=!*", "-Dsurefire.failIfNoSpecifiedTests=false", "-Dfailsafe.failIfNoSpecifiedTests=false");
+				if (params.filter) extra.push(`-Dit.test=${params.filter}`);
 			} else {
-				args.push("verify");
-				if (params.filter) args.push(`-Dtest=${params.filter}`, `-Dit.test=${params.filter}`);
+				if (params.filter) extra.push(...filterArgs(params.filter), `-Dit.test=${params.filter}`);
 			}
 
-			if (scope !== "unit" || params.filter) {
-				// In a reactor most modules will not contain the filtered test; without
-				// these, Surefire/Failsafe fail those modules instead of skipping them.
-				args.push("-Dsurefire.failIfNoSpecifiedTests=false", "-Dfailsafe.failIfNoSpecifiedTests=false");
-			}
-
-			args.push(...selectionArgs(project, params.module, params.profiles), ...(params.args ?? []));
-
-			const { content, details, succeeded } = await execAndFormat(
+			const outcome = await runAction(
 				project,
-				args,
-				"test",
-				ctx,
-				signal,
-				onUpdate,
-				params.timeoutMinutes,
+				{
+					id: params.filter ? `test:${params.filter}` : "test",
+					label: params.filter ? `test ${params.filter}` : "test",
+					goals,
+					extra: [...extra, ...(params.args ?? [])],
+					module: params.module,
+					profiles: params.profiles,
+					timeoutMinutes: params.timeoutMinutes,
+				},
+				{
+					signal,
+					onStateChange: refresh,
+					onProgress: onUpdate ? (text) => onUpdate({ content: [{ type: "text", text }], details: {} }) : undefined,
+				},
 			);
-			if (!succeeded) throw new Error(content[0].text);
-			return { content, details };
+			if (!outcome.ok) throw new Error(outcome.text);
+			return { content: [{ type: "text", text: outcome.text }], details: outcome.details };
 		},
 	});
 
@@ -291,6 +306,7 @@ export default function (pi: ExtensionAPI) {
 				if (action === "stop") {
 					await stopApp(app);
 					runningApps.delete(app.id);
+					refresh();
 					return { content: [{ type: "text", text: `Stopped ${app.id}.` }], details: { id: app.id } };
 				}
 
@@ -303,70 +319,11 @@ export default function (pi: ExtensionAPI) {
 
 			const project = requireProject(ctx);
 			const env = params.javaHome ? { JAVA_HOME: params.javaHome } : undefined;
-			const modulePath = resolveModule(project, params.module);
-			let target = params.target ?? "auto";
-
-			// --- jar: run the built artifact directly, no Maven in the loop.
-			if (target === "jar") {
-				const jar = findJar(project, modulePath);
-				if (!jar) {
-					throw new Error(
-						`No jar in ${join(project.root, modulePath ?? "", "target")}. Run mvn_build with goals ['package'] first.`,
-					);
-				}
-				const javaBin = params.javaHome ? join(params.javaHome, "bin", "java") : "java";
-				const jarArgs = ["-jar", jar, ...(params.appArgs ?? [])];
-				if (params.background) {
-					const app = startBackground(javaBin, jarArgs, project.root, env);
-					return {
-						content: [{ type: "text", text: `Started ${app.id} in background.\n${describeApp(app)}` }],
-						details: { id: app.id },
-					};
-				}
-				const run = await runMaven(javaBin, jarArgs, {
-					cwd: project.root,
-					signal,
-					timeoutMs: (params.timeoutMinutes ?? DEFAULT_TIMEOUT_MINUTES) * 60_000,
-					env,
-				});
-				const truncated = truncateTail(run.output, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
-				return {
-					content: [{ type: "text", text: `exit ${run.exitCode}\n\n${truncated.content}` }],
-					details: { exitCode: run.exitCode },
-				};
-			}
-
-			// --- resolve what "run" means for this project.
-			if (target === "auto") target = project.springBoot && !params.mainClass ? "spring-boot" : "exec";
-
-			const args = [...BASE_ARGS];
-			if (target === "spring-boot") {
-				args.push("spring-boot:run");
-				if (params.appArgs?.length) args.push(`-Dspring-boot.run.arguments=${params.appArgs.join(" ")}`);
-			} else {
-				let mainClass = params.mainClass ?? project.declaredMainClass;
-				if (!mainClass) {
-					const candidates = findMainClasses(project, modulePath);
-					if (candidates.length === 1) {
-						mainClass = candidates[0].fqn;
-					} else if (candidates.length === 0) {
-						throw new Error(
-							"No `public static void main` found in src/main/java. Pass mainClass explicitly, or use target='jar' / target='spring-boot'.",
-						);
-					} else {
-						throw new Error(
-							`Several main classes found — pass mainClass explicitly:\n${candidates.map((c) => `  ${c.fqn}  (${c.file})`).join("\n")}`,
-						);
-					}
-				}
-				args.push("compile", "exec:java", `-Dexec.mainClass=${mainClass}`);
-				if (params.appArgs?.length) args.push(`-Dexec.args=${params.appArgs.join(" ")}`);
-			}
-
-			args.push(...selectionArgs(project, params.module, params.profiles));
+			const target = resolveRunTarget(project, params);
 
 			if (params.background) {
-				const app = startBackground(project.runner, args, project.root, env);
+				const app = startBackground(target.command, target.args, project.root, env);
+				refresh();
 				return {
 					content: [
 						{
@@ -378,16 +335,22 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const { content, details } = await execAndFormat(
+			const outcome = await runAction(
 				project,
-				args,
-				"run",
-				ctx,
-				signal,
-				onUpdate,
-				params.timeoutMinutes,
+				{
+					id: "run",
+					label: target.label,
+					goals: [],
+					prebuilt: { command: target.command, args: target.args },
+					timeoutMinutes: params.timeoutMinutes,
+				},
+				{
+					signal,
+					onStateChange: refresh,
+					onProgress: onUpdate ? (text) => onUpdate({ content: [{ type: "text", text }], details: {} }) : undefined,
+				},
 			);
-			return { content, details };
+			return { content: [{ type: "text", text: outcome.text }], details: outcome.details };
 		},
 	});
 
@@ -470,10 +433,48 @@ export default function (pi: ExtensionAPI) {
 
 	// ------------------------------------------------------------- /mvn ------
 
-	const SUBCOMMANDS = ["build", "compile", "package", "test", "run", "info", "deps", "logs", "stop"];
+	const SUBCOMMANDS = ["menu", "build", "rebuild", "package", "verify", "test", "run", "info", "deps", "logs", "stop", "panel"];
+
+	/** `/mvn panel <on|off|right|left|full|above|below>`; no argument toggles. */
+	function configurePanel(ctx: ExtensionCommandContext, value: string | undefined): void {
+		switch (value) {
+			case undefined:
+			case "":
+			case "toggle":
+				panel.config.enabled = !panel.config.enabled;
+				break;
+			case "on":
+			case "off":
+				panel.config.enabled = value === "on";
+				break;
+			case "right":
+			case "left":
+			case "full":
+				panel.config.align = value;
+				panel.config.enabled = true;
+				break;
+			case "above":
+				panel.config.placement = "aboveEditor";
+				panel.config.enabled = true;
+				break;
+			case "below":
+				panel.config.placement = "belowEditor";
+				panel.config.enabled = true;
+				break;
+			default:
+				ctx.ui.notify(`/mvn panel <on|off|right|left|full|above|below>`, "warning");
+				return;
+		}
+		saveConfig(panel.config);
+		mount(ctx);
+		ctx.ui.notify(
+			panel.config.enabled ? `Panel ${panel.config.align}, ${panel.config.placement}.` : "Maven panel hidden.",
+			"info",
+		);
+	}
 
 	pi.registerCommand("mvn", {
-		description: "Maven: /mvn build | test [filter] | run [target] | info | deps | logs | stop | <raw maven args>",
+		description: "Maven: /mvn menu | build | test [filter] | run | info | deps | logs | stop | panel | <raw maven args>",
 		getArgumentCompletions: (prefix) => {
 			const items = SUBCOMMANDS.filter((s) => s.startsWith(prefix)).map((s) => ({ value: s, label: s }));
 			return items.length ? items : null;
@@ -482,6 +483,11 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx: ExtensionCommandContext) => {
 			const [sub = "info", ...rest] = args.trim().split(/\s+/).filter(Boolean);
 
+			if (sub === "panel") {
+				configurePanel(ctx, rest[0]);
+				return;
+			}
+
 			let project: MavenProject;
 			try {
 				project = requireProject(ctx);
@@ -489,10 +495,12 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(String((error as Error).message), "error");
 				return;
 			}
+			panel.project = project;
 
-			const report = (text: string) => {
-				pi.sendMessage({ customType: "pi-mvn", content: text, display: true, details: {} }, { deliverAs: "nextTurn" });
-			};
+			if (sub === "menu") {
+				await openMenu(ctx, project, { report, refresh });
+				return;
+			}
 
 			if (sub === "info") {
 				const mains = findMainClasses(project, undefined, 10);
@@ -508,7 +516,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			if (sub === "status" || sub === "logs" || sub === "stop") {
+			if (sub === "logs" || sub === "stop") {
 				const apps = [...runningApps.values()];
 				const app = rest[0] ? runningApps.get(rest[0]) : apps[apps.length - 1];
 				if (!app) {
@@ -518,6 +526,7 @@ export default function (pi: ExtensionAPI) {
 				if (sub === "stop") {
 					await stopApp(app);
 					runningApps.delete(app.id);
+					refresh();
 					ctx.ui.notify(`Stopped ${app.id}.`, "info");
 					return;
 				}
@@ -525,66 +534,55 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const mavenArgs = [...BASE_ARGS];
-			let label = sub;
-			if (sub === "build") mavenArgs.push(...(rest.length ? rest : ["compile"]));
-			else if (sub === "compile" || sub === "package") mavenArgs.push(sub, ...rest);
-			else if (sub === "test") {
-				mavenArgs.push("test");
-				if (rest[0]) mavenArgs.push(`-Dtest=${rest[0]}`, "-Dsurefire.failIfNoSpecifiedTests=false");
-			} else if (sub === "deps") {
-				mavenArgs.push("dependency:tree");
-				label = "deps";
-			} else if (sub === "run") {
-				const target = project.springBoot ? "spring-boot:run" : "exec:java";
-				if (target === "exec:java") {
-					const mainClass = rest[0] ?? project.declaredMainClass ?? findMainClasses(project)[0]?.fqn;
-					if (!mainClass) {
-						ctx.ui.notify("No main class found. Try /mvn run <fully.qualified.Main>", "error");
-						return;
-					}
-					mavenArgs.push("compile", "exec:java", `-Dexec.mainClass=${mainClass}`);
-				} else {
-					mavenArgs.push(target);
+			if (sub === "run") {
+				try {
+					const target = resolveRunTarget(project, { mainClass: rest[0] });
+					const app = startBackground(target.command, target.args, project.root);
+					refresh();
+					ctx.ui.notify(`Started ${app.id} — ${target.label}. /mvn logs to follow.`, "info");
+				} catch (error) {
+					ctx.ui.notify((error as Error).message, "error");
 				}
-			} else {
-				// Anything unrecognised is passed straight through to Maven.
-				mavenArgs.push(sub, ...rest);
-				label = "raw";
+				return;
 			}
 
-			ctx.ui.setStatus("pi-mvn", `${project.runnerLabel} ${mavenArgs.filter((a) => !BASE_ARGS.includes(a)).join(" ")}`);
-			try {
-				const run = await runMaven(project.runner, mavenArgs, {
-					cwd: project.root,
-					timeoutMs: DEFAULT_TIMEOUT_MINUTES * 60_000,
-					onPhase: (phase) => ctx.ui.setStatus("pi-mvn", `mvn: ${phase}`),
-				});
-
-				if (label === "deps") {
+			if (sub === "deps") {
+				ctx.ui.setStatus("pi-mvn", "mvn dependency:tree");
+				try {
+					const run = await runMaven(project.runner, [...BASE_ARGS, "dependency:tree"], {
+						cwd: project.root,
+						timeoutMs: 300_000,
+					});
 					report(formatDependencyTree(run.output, 2));
-				} else {
-					const parsed = parseBuildOutput(run.output);
-					const succeeded = parsed.ok && run.exitCode === 0;
-					report(
-						formatBuildResult(parsed, {
-							command: `${project.runnerLabel} ${mavenArgs.filter((a) => !BASE_ARGS.includes(a)).join(" ")}`,
-							durationMs: run.durationMs,
-							exitCode: run.exitCode,
-							root: project.root,
-							logPath: succeeded ? undefined : writeLog(run.output, label),
-						}),
-					);
-					ctx.ui.notify(succeeded ? "Build OK" : "Build FAILED", succeeded ? "info" : "error");
+				} finally {
+					ctx.ui.setStatus("pi-mvn", undefined);
 				}
+				return;
+			}
+
+			const spec: ActionSpec =
+				sub === "build"
+					? { ...PRESETS.compile, goals: rest.length ? rest : ["compile"], label: rest.length ? rest.join(" ") : "compile" }
+					: PRESETS[sub]
+						? sub === "test" && rest[0]
+							? { ...PRESETS.test, id: `test:${rest[0]}`, label: `test ${rest[0]}`, extra: filterArgs(rest[0]) }
+							: PRESETS[sub]
+						: // Anything unrecognised is passed straight through to Maven.
+							{ id: "raw", label: [sub, ...rest].join(" "), goals: [sub, ...rest] };
+
+			ctx.ui.setStatus("pi-mvn", `${project.runnerLabel} ${spec.goals.join(" ")}`);
+			try {
+				const outcome = await runAction(project, spec, {
+					onStateChange: () => {
+						refresh();
+						if (panel.running?.phase) ctx.ui.setStatus("pi-mvn", `mvn: ${panel.running.phase}`);
+					},
+				});
+				report(outcome.text);
+				ctx.ui.notify(outcome.ok ? `${spec.label} OK` : `${spec.label} FAILED`, outcome.ok ? "info" : "error");
 			} finally {
 				ctx.ui.setStatus("pi-mvn", undefined);
 			}
 		},
-	});
-
-	// Background apps are session-scoped; never leave a server running after exit.
-	pi.on("session_shutdown", async () => {
-		stopAllApps();
 	});
 }

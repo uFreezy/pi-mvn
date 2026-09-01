@@ -11,6 +11,8 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import extension from "../src/index.ts";
+import { menuItems } from "../src/menu.ts";
+import { panel } from "../src/panel.ts";
 
 const POM = `<?xml version="1.0" encoding="UTF-8"?>
 <project xmlns="http://maven.apache.org/POM/4.0.0">
@@ -72,26 +74,53 @@ function stubApi() {
 	const tools = new Map();
 	const commands = new Map();
 	const handlers = new Map();
+	const shortcuts = new Map();
 	return {
 		tools,
 		commands,
 		handlers,
+		shortcuts,
 		registerTool: (tool) => tools.set(tool.name, tool),
 		registerCommand: (name, options) => commands.set(name, options),
-		registerShortcut: () => {},
+		registerShortcut: (key, options) => shortcuts.set(key, options),
 		registerFlag: () => {},
 		sendMessage: () => {},
 		on: (event, handler) => handlers.set(event, handler),
 	};
 }
 
+/** Stand-in for the slice of TUI and Theme the panel widget touches. */
+const stubTui = { requestRender: () => {} };
+const stubTheme = { fg: (_color, text) => text, bg: (_color, text) => text };
+
 const root = createProject();
-const ctx = { cwd: root, ui: { notify: () => {}, setStatus: () => {} } };
+const widgets = new Map();
+const ctx = {
+	cwd: root,
+	hasUI: true,
+	ui: {
+		notify: () => {},
+		setStatus: () => {},
+		setWidget: (key, content, options) => widgets.set(key, { content, options }),
+	},
+};
 const pi = stubApi();
 extension(pi);
 
 assert.deepEqual([...pi.tools.keys()].sort(), ["mvn_build", "mvn_project", "mvn_run", "mvn_test"]);
 assert.ok(pi.commands.has("mvn"), "the /mvn command must be registered");
+assert.ok(pi.shortcuts.has("alt+m"), "the menu shortcut must be registered");
+
+// --- the panel mounts on session_start and renders inside its width
+await pi.handlers.get("session_start")({}, ctx);
+const widget = widgets.get("pi-mvn-panel");
+assert.ok(widget?.content, "session_start must mount the panel widget");
+assert.equal(widget.options.placement, "aboveEditor");
+
+const component = widget.content(stubTui, stubTheme);
+const idle = component.render(80);
+assert.equal(idle.length, 1, "an idle, never-built project shows one line");
+assert.match(idle[0], /maven {2}smoke/);
 
 const call = (name, params) => pi.tools.get(name).execute("smoke", params, undefined, undefined, ctx);
 const textOf = (result) => result.content[0].text;
@@ -148,6 +177,26 @@ await new Promise((resolve) => setTimeout(resolve, 25_000));
 const logs = textOf(await call("mvn_run", { action: "logs", id }));
 console.log(`\n[logs tail]\n${logs.split("\n").slice(-6).join("\n")}`);
 assert.match(logs, /started/, "the app's stdout must reach the log");
+
+// --- the panel reflects what just happened, and the menu offers a rerun
+const live = component.render(80);
+console.log(`\n[panel]\n${live.join("\n")}`);
+assert.ok(live.length >= 2, "after a run the panel shows more than the header");
+assert.ok(live.every((line) => line.length >= 80), "right alignment pads to the width");
+assert.equal(panel.last.label, "test AppTest#shouldAdd");
+assert.equal(panel.last.ok, true);
+
+const menu = menuItems(panel.project).map((item) => item.value);
+console.log(`[menu] ${menu.join(" ")}`);
+assert.ok(menu.includes("preset:compile") && menu.includes("preset:test"));
+assert.equal(
+	menu.filter((value) => value.startsWith("app:")).length > 0,
+	true,
+	"the menu must offer an app action",
+);
+assert.equal(new Set(menu).size, menu.length, "menu rows must not duplicate each other");
+assert.ok(menu.includes("rerun:last"), "a filtered test run is worth a rerun row");
+assert.ok(menu.includes("panel:hide"), "the panel must always be hideable");
 
 console.log(`\n[stop]\n${textOf(await call("mvn_run", { action: "stop", id }))}`);
 await pi.handlers.get("session_shutdown")({}, ctx);

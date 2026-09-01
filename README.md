@@ -94,12 +94,75 @@ that do not contain the test are skipped rather than failed.
 
 Background apps are session-scoped and are killed when the pi session ends.
 
+## The panel
+
+A persistent status strip in the TUI, IntelliJ's Maven tool window compressed to
+the lines that earn their space. It is adaptive: one line when idle and clean,
+growing only when something is running or broken.
+
+```
+                                     ─ maven  demo 1.0-SNAPSHOT · mvn · java 17  alt+m ─
+                        ⠋ compile   demo compiler:compile   4s
+```
+
+```
+                                     ─ maven  demo 1.0-SNAPSHOT · mvn · java 17  alt+m ─
+              ✗ test  ·  2 run · 1 failed  ·  2.2s     ● app-1  up 2m14s  :8080
+                                     AppTest.shouldFail:8  expected: <5> but was: <4>
+```
+
+The port comes from the running app's own startup banner (Spring Boot, Quarkus,
+Micronaut and plain Netty/Tomcat lines are recognised).
+
+### The actions menu
+
+`alt+m` opens the menu — the equivalent of double-clicking a goal in the
+IntelliJ tool window:
+
+```
+── maven  demo ─────────────────────────────────
+   rerun test AppTest#shouldAdd   repeat the last invocation
+   build                          mvn compile
+   rebuild                        mvn clean compile
+   test                           mvn test
+   rerun 1 failed test            AppTest#shouldFail
+   package                        mvn package -DskipTests
+   verify                         mvn verify (unit + integration tests)
+   run                            spring-boot:run in the background
+   clean                          mvn clean
+   panel align: right             cycle right / left / full
+   hide panel                     bring it back with /mvn panel on
+   ↑↓ navigate • enter run • esc close
+────────────────────────────────────────────────
+```
+
+Results go into the transcript, so whatever you run by hand, the agent sees too.
+
+### Hiding and moving it
+
+```
+/mvn panel          toggle
+/mvn panel off      hide it
+/mvn panel right    align right (default), left, or full-width
+/mvn panel above    above the editor (default), or below
+```
+
+The choice is written to `~/.pi/agent/pi-mvn.json` and survives restarts. The
+menu key lives there too (`"menuKey": "alt+m"`), and takes effect on the next
+start.
+
+**On placement:** pi's widget API offers `aboveEditor` and `belowEditor` only —
+its TUI stacks full-width line regions, so an extension cannot claim a vertical
+column down the side of the screen. `align: "right"` is the closest thing
+available: the block hugs the terminal's right edge.
+
 ## The `/mvn` command
 
 The same loop, driven by hand:
 
 ```
 /mvn                       project overview
+/mvn menu                  open the actions menu (same as alt+m)
 /mvn build                 compile
 /mvn build clean package   any goals
 /mvn test                  run tests
@@ -109,6 +172,7 @@ The same loop, driven by hand:
 /mvn deps                  dependency tree
 /mvn logs                  tail the running background app
 /mvn stop                  stop it
+/mvn panel off             hide the panel
 /mvn versions:display-dependency-updates    anything else goes straight to Maven
 ```
 
@@ -132,7 +196,7 @@ can act on it without you pasting anything.
 
 ```bash
 npm install
-npm test        # parser unit tests, no Maven needed
+npm test        # parser and panel unit tests, no Maven needed
 npm run smoke   # generates a Maven project and drives all four tools for real
 npm run typecheck
 ```
