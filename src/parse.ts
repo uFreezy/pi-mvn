@@ -220,6 +220,11 @@ function relativize(file: string, root?: string): string {
 	return file.startsWith(prefix) ? file.slice(prefix.length) : file;
 }
 
+/** A single Maven error line can be kilobytes long; the model needs the start of it. */
+function clamp(text: string, maxChars = 500): string {
+	return text.length <= maxChars ? text : `${text.slice(0, maxChars)}… (+${text.length - maxChars} chars)`;
+}
+
 function formatDuration(ms: number): string {
 	return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
 }
@@ -246,8 +251,8 @@ export function formatBuildResult(result: BuildResult, options: FormatOptions): 
 		out.push("", `Compile errors (${result.compileErrors.length}):`);
 		for (const error of result.compileErrors.slice(0, max)) {
 			const where = [relativize(error.file, options.root), error.line, error.column].filter(Boolean).join(":");
-			out.push(`  ${where}  ${error.message}`);
-			for (const detail of error.detail.slice(0, 3)) out.push(`      ${detail}`);
+			out.push(`  ${where}  ${clamp(error.message)}`);
+			for (const detail of error.detail.slice(0, 3)) out.push(`      ${clamp(detail)}`);
 		}
 		if (result.compileErrors.length > max) out.push(`  ... ${result.compileErrors.length - max} more`);
 	}
@@ -256,7 +261,7 @@ export function formatBuildResult(result: BuildResult, options: FormatOptions): 
 		out.push("", `Test failures (${result.testFailures.length}):`);
 		for (const failure of result.testFailures.slice(0, max)) {
 			const where = failure.line ? `${failure.test}:${failure.line}` : failure.test;
-			out.push(`  ${where}  ${failure.message}`.trimEnd());
+			out.push(`  ${where}  ${clamp(failure.message)}`.trimEnd());
 		}
 		if (result.testFailures.length > max) out.push(`  ... ${result.testFailures.length - max} more`);
 	}
@@ -268,7 +273,7 @@ export function formatBuildResult(result: BuildResult, options: FormatOptions): 
 
 	if (!success && generic.length) {
 		out.push("", "Errors:");
-		for (const line of generic.slice(0, max)) out.push(`  ${relativize(line, options.root)}`);
+		for (const line of generic.slice(0, max)) out.push(`  ${clamp(relativize(line, options.root))}`);
 		if (generic.length > max) out.push(`  ... ${generic.length - max} more`);
 	}
 

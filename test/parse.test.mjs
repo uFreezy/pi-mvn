@@ -157,3 +157,12 @@ test("dependency tree is flattened and depth-limited", () => {
 	assert.ok(!tree.includes("deep:deep"), "depth beyond the limit is dropped");
 	assert.ok(!tree.includes("BUILD SUCCESS"), "non-coordinate lines are dropped");
 });
+
+test("a kilobyte-long error line is clamped before it reaches the model", () => {
+	const long = "x".repeat(3000);
+	const result = parseBuildOutput(`[ERROR] Failed to resolve dependencies: ${long}\n`);
+	const text = formatBuildResult(result, { command: "mvn -B compile", durationMs: 10, exitCode: 1 });
+
+	assert.ok(text.length < 900, `expected a clamped line, got ${text.length} chars`);
+	assert.match(text, /… \(\+\d+ chars\)/);
+});
