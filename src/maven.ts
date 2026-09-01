@@ -1,7 +1,7 @@
 /** Spawning Maven and the app it builds, plus the background process registry. */
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { createWriteStream, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { closeSync, createWriteStream, fstatSync, mkdtempSync, openSync, readSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -51,6 +51,9 @@ export function runMaven(command: string, args: string[], options: MavenRunOptio
 			cwd: options.cwd,
 			env: mavenEnv(options.env),
 			stdio: ["ignore", "pipe", "pipe"],
+			// Own process group, so a timeout/abort can kill mvn and the JVMs it
+			// forked (surefire, spring-boot) in one shot instead of leaving orphans.
+			detached: true,
 		});
 
 		const chunks: string[] = [];
@@ -77,11 +80,11 @@ export function runMaven(command: string, args: string[], options: MavenRunOptio
 		const timer = options.timeoutMs
 			? setTimeout(() => {
 					timedOut = true;
-					child.kill("SIGKILL");
+					killTree(child, "SIGKILL");
 				}, options.timeoutMs)
 			: undefined;
 
-		const onAbort = () => child.kill("SIGKILL");
+		const onAbort = () => killTree(child, "SIGKILL");
 		options.signal?.addEventListener("abort", onAbort, { once: true });
 
 		const finish = (exitCode: number) => {
@@ -108,6 +111,24 @@ export function writeLog(output: string, label: string): string {
 	return path;
 }
 
+/**
+ * SIGKILL/SIGTERM to just the `mvn` pid leaves the JVMs it forked (surefire,
+ * the spring-boot app) running as orphans; signal the whole process group.
+ * Children are spawned `detached`, so `-pid` addresses their group.
+ */
+function killTree(child: ChildProcess, signal: NodeJS.Signals = "SIGKILL"): void {
+	if (child.pid === undefined) return;
+	try {
+		process.kill(-child.pid, signal);
+	} catch {
+		try {
+			child.kill(signal);
+		} catch {
+			/* already gone */
+		}
+	}
+}
+
 export interface BackgroundApp {
 	id: string;
 	command: string;
@@ -120,13 +141,20 @@ export interface BackgroundApp {
 /** Apps started with `background: true`, keyed by id. Session-scoped. */
 export const runningApps = new Map<string, BackgroundApp>();
 
+let appSeq = 0;
+
 export function startBackground(command: string, args: string[], cwd: string, env?: Record<string, string>): BackgroundApp {
-	const id = `app-${runningApps.size + 1}-${Date.now().toString(36)}`;
+	const id = `app-${++appSeq}-${Date.now().toString(36)}`;
 	const dir = mkdtempSync(join(tmpdir(), "pi-mvn-"));
 	const logPath = join(dir, `${id}.log`);
 	const log = createWriteStream(logPath);
 
-	const child = spawn(command, args, { cwd, env: mavenEnv(env), stdio: ["ignore", "pipe", "pipe"] });
+	const child = spawn(command, args, {
+		cwd,
+		env: mavenEnv(env),
+		stdio: ["ignore", "pipe", "pipe"],
+		detached: true,
+	});
 	child.stdout.pipe(log);
 	child.stderr.pipe(log);
 
@@ -138,10 +166,28 @@ export function startBackground(command: string, args: string[], cwd: string, en
 	return app;
 }
 
+/**
+ * Last `lines` lines of the log, read through a bounded 64KB window from the
+ * end instead of the whole file — the panel calls this every second while an
+ * app runs, so an unbounded read would re-scan a growing server log each tick.
+ */
 export function tailLog(path: string, lines: number): string {
+	const WINDOW = 64 * 1024;
 	try {
-		const all = readFileSync(path, "utf8").split("\n");
-		return all.slice(Math.max(0, all.length - lines)).join("\n");
+		const fd = openSync(path, "r");
+		try {
+			const size = fstatSync(fd).size;
+			const start = Math.max(0, size - WINDOW);
+			const buf = Buffer.alloc(size - start);
+			if (buf.length) readSync(fd, buf, 0, buf.length, start);
+			const all = buf.toString("utf8").split("\n");
+			// A log ends with "\n", leaving a phantom empty last element;
+			// drop it so `lines` means trailing lines, not that plus """
+			if (all.length > 1 && all[all.length - 1] === "") all.pop();
+			return all.slice(Math.max(0, all.length - lines)).join("\n");
+		} finally {
+			closeSync(fd);
+		}
 	} catch {
 		return "(no output yet)";
 	}
@@ -149,12 +195,12 @@ export function tailLog(path: string, lines: number): string {
 
 export async function stopApp(app: BackgroundApp): Promise<void> {
 	if (app.child.exitCode !== null || app.child.killed) return;
-	app.child.kill("SIGTERM");
+	killTree(app.child, "SIGTERM");
 	// ponytail: fixed 3s grace before SIGKILL. Long enough for a Spring Boot
 	// shutdown hook; make it a parameter if some app legitimately needs more.
 	await new Promise<void>((resolve) => {
 		const timer = setTimeout(() => {
-			app.child.kill("SIGKILL");
+			killTree(app.child, "SIGKILL");
 			resolve();
 		}, 3000);
 		app.child.once("close", () => {
@@ -166,7 +212,7 @@ export async function stopApp(app: BackgroundApp): Promise<void> {
 
 export function stopAllApps(): void {
 	for (const app of runningApps.values()) {
-		if (app.child.exitCode === null && !app.child.killed) app.child.kill("SIGKILL");
+		if (app.child.exitCode === null && !app.child.killed) killTree(app.child, "SIGKILL");
 	}
 	runningApps.clear();
 }
