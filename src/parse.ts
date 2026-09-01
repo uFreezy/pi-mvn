@@ -3,6 +3,12 @@
  *
  * This is the reason the extension exists. A failing `mvn verify` prints
  * thousands of lines; the model needs the ten that say what broke and where.
+ *
+ * ponytail: failures are read from Maven's console output, not from the Surefire
+ * XML reports. Console gives the same "Class.method:line message" for free and
+ * costs no XML dependency, but it truncates very long assertion messages and
+ * omits stack frames. Switch to target/surefire-reports/*.xml if that ceiling
+ * is ever reached; the full log path is already returned in the meantime.
  */
 
 export interface CompileError {
