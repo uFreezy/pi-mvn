@@ -51,6 +51,18 @@ test("boilerplate never reaches the model as a generic error", () => {
 	assert.ok(!generic.some((line) => line.includes("[Help 1]")));
 });
 
+test("newer Surefire's report pointers are noise too", () => {
+	const { generic, testFailures } = parseBuildOutput(
+		`[ERROR] Failures:\n[ERROR]   AppTest.shouldAdd:12 expected: <4> but was: <5>\n` +
+			`[ERROR] See /home/x/demo/target/surefire-reports for the individual test results.\n` +
+			`[ERROR] See dump files (if any exist) [date].dump, [date]-jvmRun[N].dump and [date].dumpstream.\n`,
+	);
+
+	assert.equal(testFailures.length, 1, "the failure itself survives");
+	assert.ok(!generic.some((line) => line.includes("surefire-reports")));
+	assert.ok(!generic.some((line) => line.includes("dump files")));
+});
+
 const TEST_FAILURE = `[INFO] --- surefire:3.2.5:test (default-test) @ demo ---
 [INFO] Running com.example.AppTest
 [ERROR] Tests run: 3, Failures: 1, Errors: 1, Skipped: 0, Time elapsed: 0.03 s <<< FAILURE! -- in com.example.AppTest

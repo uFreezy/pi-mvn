@@ -88,6 +88,8 @@ function isNoise(text: string): boolean {
 		/^After correcting the problems/.test(text) ||
 		/^Please read the following articles/.test(text) ||
 		/^Please refer to /.test(text) ||
+		/^See \S+surefire-reports/.test(text) ||
+		/^See dump files \(if any exist\)/.test(text) ||
 		/<<<\s*(FAILURE|ERROR)!/.test(text) ||
 		/^https?:\/\/cwiki\.apache\.org/.test(text) ||
 		/^\d+ errors?$/.test(text)

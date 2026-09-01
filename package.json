@@ -1,6 +1,6 @@
 {
   "name": "pi-mvn",
-  "version": "0.2.0",
+  "version": "1.0.0",
   "description": "Maven and Java tooling for the pi coding agent: build, test and run Maven projects with parsed output, plus a status panel and actions menu in the TUI",
   "keywords": [
     "pi-package",

@@ -186,7 +186,9 @@ can act on it without you pasting anything.
 - Both `File.java:[12,34] message` and `File.java:12: error: message` forms are parsed,
   so a raw `javac` or `kotlinc` error is understood as well.
 - Boilerplate is dropped: `[Help 1]`, "re-run Maven with the -e switch", "Please refer
-  to .../surefire-reports", the `<<< FAILURE!` banners, separator rules.
+  to .../surefire-reports", the `<<< FAILURE!` banners, separator rules and the
+  report-pointer lines newer Surefire versions print (`See .../surefire-reports`,
+  `See dump files (if any exist)`).
 - `Failed to execute goal ...: Compilation failure` is suppressed when the individual
   errors are already listed, and kept when they are not.
 - Maven runs under `-B --no-transfer-progress` with an English locale pinned via
