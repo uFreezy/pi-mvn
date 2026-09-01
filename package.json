@@ -1,0 +1,57 @@
+{
+  "name": "pi-mvn",
+  "version": "0.1.0",
+  "description": "Maven and Java tooling for the pi coding agent: build, test, run and inspect Maven projects with parsed, context-friendly output",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "extension",
+    "maven",
+    "mvn",
+    "java",
+    "jvm",
+    "build",
+    "spring-boot"
+  ],
+  "author": "Denis Neychev",
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/uFreezy/pi-mvn.git"
+  },
+  "homepage": "https://github.com/uFreezy/pi-mvn#readme",
+  "bugs": {
+    "url": "https://github.com/uFreezy/pi-mvn/issues"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\"",
+    "typecheck": "tsc --noEmit",
+    "smoke": "node test/smoke.mjs"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.84.0",
+    "@earendil-works/pi-coding-agent": "^0.84.0",
+    "@types/node": "^24.0.0",
+    "typebox": "^1.3.7",
+    "typescript": "^5.9.0"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  }
+}
